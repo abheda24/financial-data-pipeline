@@ -1,0 +1,113 @@
+from pyspark.sql import SparkSession, Window  # Added Window import
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import logging
+from kafka import KafkaProducer, KafkaConsumer
+import json
+import redis
+from datetime import datetime
+
+class RealTimeMarketAnalytics:
+    def __init__(self):
+        # Initialize Spark with advanced configurations
+        self.spark = SparkSession.builder \
+            .appName("RealTimeMarketAnalytics") \
+            .config("spark.streaming.backpressure.enabled", "true") \
+            .config("spark.streaming.kafka.maxRatePerPartition", "10000") \
+            .config("spark.cassandra.connection.host", "localhost") \
+            .getOrCreate()
+            
+        # Initialize Redis for caching
+        self.redis_client = redis.Redis(host='localhost', port=6379, db=0)
+        
+        self.logger = logging.getLogger(__name__)
+
+    def process_stream(self):
+        # Define schema for market data
+        schema = StructType([
+            StructField("symbol", StringType()),
+            StructField("timestamp", TimestampType()),
+            StructField("price", DoubleType()),
+            StructField("volume", LongType())
+        ])
+
+        # Read from Kafka
+        stream_df = self.spark \
+            .readStream \
+            .format("kafka") \
+            .option("kafka.bootstrap.servers", "localhost:9092") \
+            .option("subscribe", "market_data") \
+            .load()
+
+        # Parse JSON data
+        parsed_df = stream_df.select(
+            from_json(col("value").cast("string"), schema).alias("data")
+        ).select("data.*")
+
+        # Define window for anomaly detection
+        anomaly_window = Window.partitionBy("symbol")
+
+        # Complex Event Processing
+        windowed_stats = parsed_df \
+            .withWatermark("timestamp", "2 minutes") \
+            .groupBy(
+                window("timestamp", "1 minute"),
+                "symbol"
+            ) \
+            .agg(
+                avg("price").alias("avg_price"),
+                sum("volume").alias("total_volume"),
+                stddev("price").alias("price_volatility"),
+                count("*").alias("update_count")
+            )
+
+        # Anomaly Detection
+        anomaly_detection = windowed_stats \
+            .withColumn(
+                "is_anomaly",
+                when(col("price_volatility") > 2 * avg("price_volatility")
+                    .over(anomaly_window), True)
+                .otherwise(False)
+            )
+
+        # Write to multiple sinks
+        query = anomaly_detection \
+            .writeStream \
+            .outputMode("append") \
+            .format("console") \
+            .start()
+
+        return query
+
+    def detect_market_patterns(self, df):
+        """Detect complex market patterns in real-time."""
+        # Define window for pattern detection
+        pattern_window = Window.partitionBy("symbol").orderBy("timestamp")
+        
+        pattern_rules = {
+            'price_surge': col("price") > lag("price", 1).over(pattern_window) * 1.02,
+            'volume_spike': col("volume") > lag("volume", 1).over(pattern_window) * 3,
+            'momentum_shift': (col("price") > lag("price", 1).over(pattern_window)) & 
+                            (lag("price", 1).over(pattern_window) > lag("price", 2).over(pattern_window)) & 
+                            (lag("price", 2).over(pattern_window) > lag("price", 3).over(pattern_window))
+        }
+
+        for pattern_name, condition in pattern_rules.items():
+            df = df.withColumn(pattern_name, condition)
+
+        return df
+
+    def calculate_advanced_metrics(self, df):
+        """Calculate advanced trading metrics."""
+        window_spec = Window.partitionBy("symbol").orderBy("timestamp")
+        
+        return df \
+            .withColumn("price_momentum", 
+                col("price") / lag("price", 10).over(window_spec) - 1) \
+            .withColumn("volume_momentum",
+                col("volume") / avg("volume").over(window_spec.rowsBetween(-20, 0))) \
+            .withColumn("volatility",
+                stddev("price").over(window_spec.rowsBetween(-30, 0))) \
+            .withColumn("vwap",
+                sum(col("price") * col("volume")).over(window_spec) / 
+                sum(col("volume")).over(window_spec))
